@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/andybalholm/brotli"
+	"github.com/avast/retry-go/v4"
 	utls "github.com/refraction-networking/utls"
 	"github.com/wangluozhe/chttp"
 	"github.com/wangluozhe/chttp/cookiejar"
@@ -189,6 +190,7 @@ type Session struct {
 	transport     *http.Transport
 	request       *http.Request
 	client        *http.Client
+	useJa3Client  bool
 }
 
 // 预请求处理
@@ -244,7 +246,22 @@ func (s *Session) Request(method, rawurl string, request *url.Request) (*models.
 	if err != nil {
 		return nil, err
 	}
-	resp, err := s.Send(preq, request)
+
+	resp, err := retry.DoWithData(func() (resp *models.Response, sendErr error) {
+		defer func() {
+			if err := recover(); err != nil {
+				sendErr = err.(error)
+			}
+		}()
+		resp, sendErr = s.Send(preq, request)
+		if sendErr != nil {
+			fmt.Println(sendErr)
+		}
+		return resp, sendErr
+	}, retry.Delay(time.Second),
+		retry.Attempts(3),
+		retry.DelayType(retry.FixedDelay))
+
 	if err != nil {
 		return nil, err
 	}
@@ -314,43 +331,46 @@ func (s *Session) Send(preq *models.PrepareRequest, req *url.Request) (*models.R
 	}
 
 	// 设置JA3指纹信息
-	ja3String := merge_setting(s.Ja3, req.Ja3).(string)
-	if ja3String != "" && strings.HasPrefix(preq.Url, "https") {
-		browser := ja3.Browser{
-			JA3:       ja3String,
-			UserAgent: s.Headers.Get("User-Agent"),
-		}
-
-		// 自定义TLS指纹信息
-		tlsExtensions := merge_setting(req.TLSExtensions, s.TLSExtensions).(*ja3.TLSExtensions)
-		http2Settings := merge_setting(req.HTTP2Settings, s.HTTP2Settings).(*http2.HTTP2Settings)
-		if strings.Index(strings.Split(browser.JA3, ",")[2], "-41") != -1 {
-			config := s.transport.TLSClientConfig.Clone()
-			if config.ClientSessionCache == nil {
-				config.SessionTicketKey = [32]byte{}
-				config.OmitEmptyPsk = true
-				config.ClientSessionCache = utls.NewLRUClientSessionCache(0)
-				s.transport.TLSClientConfig = config
+	if req.Ja3 != "" || !s.useJa3Client {
+		ja3String := merge_setting(s.Ja3, req.Ja3).(string)
+		if ja3String != "" && strings.HasPrefix(preq.Url, "https") {
+			browser := ja3.Browser{
+				JA3:       ja3String,
+				UserAgent: s.Headers.Get("User-Agent"),
 			}
-		}
 
-		options := &ja3.Options{
-			Browser:       browser,
-			TLSExtensions: tlsExtensions,
-			HTTP2Settings: http2Settings,
-			ForceHTTP1:    req.ForceHTTP1,
-			TLSConfig:     s.transport.TLSClientConfig,
-		}
+			// 自定义TLS指纹信息
+			tlsExtensions := merge_setting(req.TLSExtensions, s.TLSExtensions).(*ja3.TLSExtensions)
+			http2Settings := merge_setting(req.HTTP2Settings, s.HTTP2Settings).(*http2.HTTP2Settings)
+			if strings.Index(strings.Split(browser.JA3, ",")[2], "-41") != -1 {
+				config := s.transport.TLSClientConfig.Clone()
+				if config.ClientSessionCache == nil {
+					config.SessionTicketKey = [32]byte{}
+					config.OmitEmptyPsk = true
+					config.ClientSessionCache = utls.NewLRUClientSessionCache(0)
+					s.transport.TLSClientConfig = config
+				}
+			}
 
-		if proxies != "" {
-			options.Proxy = proxies
-		}
+			options := &ja3.Options{
+				Browser:       browser,
+				TLSExtensions: tlsExtensions,
+				HTTP2Settings: http2Settings,
+				ForceHTTP1:    req.ForceHTTP1,
+				TLSConfig:     s.transport.TLSClientConfig,
+			}
 
-		client, err := ja3.NewClient(options)
-		if err != nil {
-			return nil, err
+			if proxies != "" {
+				options.Proxy = proxies
+			}
+
+			client, err := ja3.NewClient(options)
+			if err != nil {
+				return nil, err
+			}
+			s.client = &client
+			s.useJa3Client = true
 		}
-		s.client = &client
 	}
 
 	// 是否验证证书
